@@ -27,7 +27,17 @@ PER_100_NUTRITION = {
     "Breakfast": {"calories": 370, "protein": 9,   "carbs": 68, "fat": 5,   "fibre": 8},
     "Beverages": {"calories": 42,  "protein": 0.3, "carbs": 10, "fat": 0,   "fibre": 0},
     "Snacks":    {"calories": 500, "protein": 6,   "carbs": 55, "fat": 28,  "fibre": 3},
+    "Condiments":{"calories": 20,  "protein": 0.5, "carbs": 3,  "fat": 0.5, "fibre": 0},
 }
+
+# Keywords that should be treated as low-calorie condiments/seasonings
+# even though their CSV category is "Pantry" — otherwise something
+# like a 1kg bag of salt gets treated as 1kg of flour/rice calories
+CONDIMENT_KEYWORDS = ["salt", "pepper", "sauce", "soy", "mayo", "vinegar", "spice"]
+
+def is_condiment(item_name):
+    name = item_name.lower()
+    return any(k in name for k in CONDIMENT_KEYWORDS)
 
 # Fallback package weight (grams) when an item's name has no
 # parseable size — e.g. "Broccoli", "Avocado", "Garlic Bulb"
@@ -42,43 +52,56 @@ PACK_PATTERN = re.compile(r'(\d+)\s*pk\b', re.IGNORECASE)
 EGG_APPROX_WEIGHT_G = 55  # typical single egg weight
 
 
-def parse_package_grams(item_name, category):
+def parse_package_grams(item_name, category, unit_str=None):
     """Work out a realistic weight (in grams) for ONE unit of this
-    product, using the size printed in its name. Falls back to a
-    sensible category default if no size can be parsed."""
-    name = item_name.lower()
+    product. Prefers the real 'unit' column from the CSV; falls back
+    to parsing the item name, then to a category default."""
 
-    # Pack-count items (e.g. "Eggs Free Range 12pk")
-    pack_match = PACK_PATTERN.search(name)
-    if pack_match and category == "Eggs":
-        count = int(pack_match.group(1))
-        return count * EGG_APPROX_WEIGHT_G
-
-    size_match = SIZE_PATTERN.search(name)
-    if size_match:
-        value = float(size_match.group(1))
-        unit = size_match.group(2).lower()
+    def convert(value, unit):
+        unit = unit.lower()
         if unit == "kg":
             return value * 1000
         if unit == "g":
             return value
         if unit == "l":
-            return value * 1000  # approx 1L ≈ 1000g for most foods/drinks
+            return value * 1000
         if unit == "ml":
             return value
+        return None
 
+    # 1) Prefer the real CSV 'unit' column, e.g. "2L", "500g", "12pk"
+    if unit_str:
+        u = unit_str.strip().lower()
+        pack_match = PACK_PATTERN.search(u)
+        if pack_match and category == "Eggs":
+            return int(pack_match.group(1)) * EGG_APPROX_WEIGHT_G
+        size_match = SIZE_PATTERN.search(u)
+        if size_match:
+            grams = convert(float(size_match.group(1)), size_match.group(2))
+            if grams:
+                return grams
+
+    # 2) Fall back to parsing the item name
+    name = item_name.lower()
+    pack_match = PACK_PATTERN.search(name)
+    if pack_match and category == "Eggs":
+        return int(pack_match.group(1)) * EGG_APPROX_WEIGHT_G
+    size_match = SIZE_PATTERN.search(name)
+    if size_match:
+        grams = convert(float(size_match.group(1)), size_match.group(2))
+        if grams:
+            return grams
+
+    # 3) Category default as last resort
     return CATEGORY_DEFAULT_WEIGHT_G.get(category, 400)
 
 
-def build_item_nutrition(item_name, category):
-    """Real per-item nutrition for ONE package/unit as sold,
-    scaled from the per-100g/ml category baseline by the item's
-    actual parsed package size."""
-    baseline = PER_100_NUTRITION.get(category, PER_100_NUTRITION["Pantry"])
-    grams = parse_package_grams(item_name, category)
+def build_item_nutrition(item_name, category, unit_str=None):
+    effective_category = "Condiments" if is_condiment(item_name) else category
+    baseline = PER_100_NUTRITION.get(effective_category, PER_100_NUTRITION["Pantry"])
+    grams = parse_package_grams(item_name, effective_category, unit_str)
     factor = grams / 100.0
     return {k: round(v * factor, 1) for k, v in baseline.items()}
-
 
 # ═══════════════════════════════════════
 # LOAD GROCERY DATA FROM CSV
@@ -102,9 +125,9 @@ def load_grocery_data():
                     "Woolworths": float(row['woolworths']),
                 }
 
-                # Real, item-specific nutrition (per package as sold),
-                # not a flat category average
-                nutrition_data[name] = build_item_nutrition(name, category)
+                # Real, item-specific nutrition — uses the CSV's actual
+                # 'unit' column (e.g. "2L", "500g") when available
+                nutrition_data[name] = build_item_nutrition(name, category, row.get('unit'))
 
         print(f"✅ Loaded {len(grocery_data)} items from CSV!")
     except Exception as e:
@@ -116,9 +139,9 @@ def load_grocery_data():
             "Broccoli":                  {"Pak'nSave": 1.99, "New World": 2.49, "Woolworths": 2.29},
         }
         nutrition_data = {
-            "Anchor Full Cream Milk 2L": build_item_nutrition("Anchor Full Cream Milk 2L", "Dairy"),
-            "Eggs Free Range 12pk":      build_item_nutrition("Eggs Free Range 12pk", "Eggs"),
-            "Broccoli":                  build_item_nutrition("Broccoli", "Vegetables"),
+            "Anchor Full Cream Milk 2L": build_item_nutrition("Anchor Full Cream Milk 2L", "Dairy", "2L"),
+            "Eggs Free Range 12pk":      build_item_nutrition("Eggs Free Range 12pk", "Eggs", "12pk"),
+            "Broccoli":                  build_item_nutrition("Broccoli", "Vegetables", None),
         }
 
     return grocery_data, nutrition_data
