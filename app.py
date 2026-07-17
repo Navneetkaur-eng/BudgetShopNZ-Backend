@@ -4,9 +4,81 @@ from io import BytesIO
 import datetime
 import csv
 import os
+import re
 
 app = Flask(__name__)
 CORS(app)
+
+# ═══════════════════════════════════════
+# NUTRITION: PER-100g/100ml BASELINES BY CATEGORY
+# (used together with each item's real package size,
+#  parsed from its name, so two items in the same
+#  category no longer get identical nutrition totals)
+# ═══════════════════════════════════════
+PER_100_NUTRITION = {
+    "Dairy":     {"calories": 65,  "protein": 3.4, "carbs": 5,  "fat": 3.6, "fibre": 0},
+    "Eggs":      {"calories": 155, "protein": 13,  "carbs": 1,  "fat": 11,  "fibre": 0},
+    "Bread":     {"calories": 250, "protein": 9,   "carbs": 47, "fat": 3,   "fibre": 4},
+    "Meat":      {"calories": 200, "protein": 25,  "carbs": 0,  "fat": 12,  "fibre": 0},
+    "Seafood":   {"calories": 130, "protein": 22,  "carbs": 0,  "fat": 5,   "fibre": 0},
+    "Vegetables":{"calories": 35,  "protein": 2,   "carbs": 7,  "fat": 0.2, "fibre": 3},
+    "Fruit":     {"calories": 55,  "protein": 0.7, "carbs": 14, "fat": 0.2, "fibre": 2.5},
+    "Pantry":    {"calories": 350, "protein": 8,   "carbs": 65, "fat": 4,   "fibre": 3},
+    "Breakfast": {"calories": 370, "protein": 9,   "carbs": 68, "fat": 5,   "fibre": 8},
+    "Beverages": {"calories": 42,  "protein": 0.3, "carbs": 10, "fat": 0,   "fibre": 0},
+    "Snacks":    {"calories": 500, "protein": 6,   "carbs": 55, "fat": 28,  "fibre": 3},
+}
+
+# Fallback package weight (grams) when an item's name has no
+# parseable size — e.g. "Broccoli", "Avocado", "Garlic Bulb"
+CATEGORY_DEFAULT_WEIGHT_G = {
+    "Dairy": 500, "Eggs": 600, "Bread": 700, "Meat": 500, "Seafood": 300,
+    "Vegetables": 150, "Fruit": 150, "Pantry": 400, "Breakfast": 500,
+    "Beverages": 500, "Snacks": 200,
+}
+
+SIZE_PATTERN = re.compile(r'(\d+\.?\d*)\s*(kg|g|ml|l)\b', re.IGNORECASE)
+PACK_PATTERN = re.compile(r'(\d+)\s*pk\b', re.IGNORECASE)
+EGG_APPROX_WEIGHT_G = 55  # typical single egg weight
+
+
+def parse_package_grams(item_name, category):
+    """Work out a realistic weight (in grams) for ONE unit of this
+    product, using the size printed in its name. Falls back to a
+    sensible category default if no size can be parsed."""
+    name = item_name.lower()
+
+    # Pack-count items (e.g. "Eggs Free Range 12pk")
+    pack_match = PACK_PATTERN.search(name)
+    if pack_match and category == "Eggs":
+        count = int(pack_match.group(1))
+        return count * EGG_APPROX_WEIGHT_G
+
+    size_match = SIZE_PATTERN.search(name)
+    if size_match:
+        value = float(size_match.group(1))
+        unit = size_match.group(2).lower()
+        if unit == "kg":
+            return value * 1000
+        if unit == "g":
+            return value
+        if unit == "l":
+            return value * 1000  # approx 1L ≈ 1000g for most foods/drinks
+        if unit == "ml":
+            return value
+
+    return CATEGORY_DEFAULT_WEIGHT_G.get(category, 400)
+
+
+def build_item_nutrition(item_name, category):
+    """Real per-item nutrition for ONE package/unit as sold,
+    scaled from the per-100g/ml category baseline by the item's
+    actual parsed package size."""
+    baseline = PER_100_NUTRITION.get(category, PER_100_NUTRITION["Pantry"])
+    grams = parse_package_grams(item_name, category)
+    factor = grams / 100.0
+    return {k: round(v * factor, 1) for k, v in baseline.items()}
+
 
 # ═══════════════════════════════════════
 # LOAD GROCERY DATA FROM CSV
@@ -14,40 +86,26 @@ CORS(app)
 def load_grocery_data():
     grocery_data = {}
     nutrition_data = {}
-    
-    # Default nutrition per 100g (approximate)
-    default_nutrition = {
-        "Dairy":     {"calories": 120, "protein": 6,  "carbs": 10, "fat": 6,  "fibre": 0},
-        "Eggs":      {"calories": 155, "protein": 13, "carbs": 1,  "fat": 11, "fibre": 0},
-        "Bread":     {"calories": 240, "protein": 8,  "carbs": 45, "fat": 3,  "fibre": 3},
-        "Meat":      {"calories": 200, "protein": 25, "carbs": 0,  "fat": 12, "fibre": 0},
-        "Seafood":   {"calories": 130, "protein": 22, "carbs": 0,  "fat": 5,  "fibre": 0},
-        "Vegetables":{"calories": 50,  "protein": 3,  "carbs": 10, "fat": 0,  "fibre": 4},
-        "Fruit":     {"calories": 80,  "protein": 1,  "carbs": 20, "fat": 0,  "fibre": 3},
-        "Pantry":    {"calories": 180, "protein": 5,  "carbs": 35, "fat": 3,  "fibre": 2},
-        "Breakfast": {"calories": 160, "protein": 5,  "carbs": 32, "fat": 2,  "fibre": 4},
-        "Beverages": {"calories": 45,  "protein": 0,  "carbs": 11, "fat": 0,  "fibre": 0},
-        "Snacks":    {"calories": 220, "protein": 3,  "carbs": 28, "fat": 11, "fibre": 1},
-    }
-    
+
     csv_path = os.path.join(os.path.dirname(__file__), 'nz_grocery_data.csv')
-    
+
     try:
         with open(csv_path, 'r', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 name = row['item_name'].strip()
                 category = row['category'].strip()
-                
+
                 grocery_data[name] = {
                     "Pak'nSave": float(row['paknsave']),
                     "New World": float(row['newworld']),
                     "Woolworths": float(row['woolworths']),
                 }
-                
-                nutr = default_nutrition.get(category, default_nutrition["Pantry"])
-                nutrition_data[name] = nutr.copy()
-                
+
+                # Real, item-specific nutrition (per package as sold),
+                # not a flat category average
+                nutrition_data[name] = build_item_nutrition(name, category)
+
         print(f"✅ Loaded {len(grocery_data)} items from CSV!")
     except Exception as e:
         print(f"❌ CSV Error: {e}")
@@ -58,11 +116,11 @@ def load_grocery_data():
             "Broccoli":                  {"Pak'nSave": 1.99, "New World": 2.49, "Woolworths": 2.29},
         }
         nutrition_data = {
-            "Anchor Full Cream Milk 2L": {"calories": 130, "protein": 8, "carbs": 12, "fat": 5, "fibre": 0},
-            "Eggs Free Range 12pk":      {"calories": 155, "protein": 13, "carbs": 1, "fat": 11, "fibre": 0},
-            "Broccoli":                  {"calories": 55, "protein": 4, "carbs": 11, "fat": 0, "fibre": 5},
+            "Anchor Full Cream Milk 2L": build_item_nutrition("Anchor Full Cream Milk 2L", "Dairy"),
+            "Eggs Free Range 12pk":      build_item_nutrition("Eggs Free Range 12pk", "Eggs"),
+            "Broccoli":                  build_item_nutrition("Broccoli", "Vegetables"),
         }
-    
+
     return grocery_data, nutrition_data
 
 grocery_data, nutrition_data = load_grocery_data()
@@ -96,7 +154,7 @@ def find_item(search_name):
 def health():
     return jsonify({
         "status": "BudgetShop NZ API running!",
-        "version": "3.0.0",
+        "version": "3.1.0",
         "total_items": len(grocery_data)
     })
 
@@ -131,7 +189,7 @@ def get_all_items():
     })
 
 # ═══════════════════════════════════════
-# ROUTE 5 — ML BUDGET OPTIMISATION
+# ROUTE 5 — ML BUDGET OPTIMISATION (FIXED)
 # ═══════════════════════════════════════
 @app.route('/api/optimise', methods=['POST'])
 def optimise():
@@ -154,18 +212,22 @@ def optimise():
             unmatched_items.append(item_name)
 
     total_cost = 0
-    single_store_cost = 0
     store_plan = {}
+
+    # Real per-store totals — same items & quantities, priced as if
+    # bought entirely from that ONE store (not a "max price" guess)
+    all_stores = ["Pak'nSave", "New World", "Woolworths"]
+    single_store_totals = {store: 0 for store in all_stores}
 
     for item_name, qty in item_quantities.items():
         prices = grocery_data[item_name]
         cheapest_store = min(prices, key=prices.get)
         cheapest_price = prices[cheapest_store]
         total_item_price = round(cheapest_price * qty, 2)
-        max_price = max(prices.values())
-
         total_cost += total_item_price
-        single_store_cost += round(max_price * qty, 2)
+
+        for store in all_stores:
+            single_store_totals[store] += round(prices[store] * qty, 2)
 
         if cheapest_store not in store_plan:
             store_plan[cheapest_store] = []
@@ -178,25 +240,27 @@ def optimise():
             "all_prices": prices
         })
 
-    savings = round(single_store_cost - total_cost, 2)
+    single_store_totals = {k: round(v, 2) for k, v in single_store_totals.items()}
+    best_single_store = min(single_store_totals.values()) if single_store_totals else total_cost
+    savings = round(best_single_store - total_cost, 2)
 
-    # Real nutrition calculation
+    # Real, item-specific nutrition totals (each item scaled by its
+    # actual package size, not a flat category average)
     nutrition_total = {"calories": 0, "protein": 0, "carbs": 0, "fat": 0, "fibre": 0}
     for item_name, qty in item_quantities.items():
-        matched = find_item(item_name)
-        if matched and matched in nutrition_data:
+        if item_name in nutrition_data:
             for key in nutrition_total:
-                nutrition_total[key] += round(nutrition_data[matched][key] * qty, 1)
+                nutrition_total[key] += round(nutrition_data[item_name][key] * qty, 1)
+    nutrition_total = {k: round(v, 1) for k, v in nutrition_total.items()}
 
     guidelines = {"calories": 2000, "protein": 50, "carbs": 250, "fat": 70, "fibre": 25}
     meets = all(nutrition_total[k] >= guidelines[k] * 0.7 for k in guidelines)
 
-    # Per item nutrition
+    # Per-item nutrition breakdown (for the "Per item" toggle in Results)
     item_nutrition = {}
     for item_name, qty in item_quantities.items():
-        matched = find_item(item_name)
-        if matched and matched in nutrition_data:
-            nutr = nutrition_data[matched]
+        if item_name in nutrition_data:
+            nutr = nutrition_data[item_name]
             item_nutrition[item_name] = {
                 "calories": round(nutr["calories"] * qty, 1),
                 "protein": round(nutr["protein"] * qty, 1),
@@ -210,7 +274,9 @@ def optimise():
         "optimised_plan": store_plan,
         "total_cost": round(total_cost, 2),
         "savings": max(savings, 0),
+        "single_store_totals": single_store_totals,
         "within_budget": total_cost <= budget,
+        "budget": budget,
         "nutrition": nutrition_total,
         "item_nutrition": item_nutrition,
         "meets_moh_nz_2020": meets,
@@ -240,7 +306,7 @@ def check_nutrition():
 
     return jsonify({
         "status": "success",
-        "nutrition": total,
+        "nutrition": {k: round(v, 1) for k, v in total.items()},
         "guidelines": guidelines,
         "meets_moh_nz_2020": meets
     })
@@ -277,7 +343,6 @@ def generate_report():
     BLUE = HexColor('#1565C0')
     LIGHT_GREY = HexColor('#F5F5F5')
 
-    # Header
     header_data = [[
         Paragraph(f'<font color="white" size="18"><b>BudgetShop NZ</b></font><br/><font color="#A5D6A7" size="10">Weekly Shopping Plan · Auckland · {datetime.date.today().strftime("%d %B %Y")}</font>', styles['Normal']),
         Paragraph(f'<font color="white" size="16"><b>${total_cost:.2f} total</b></font><br/><font color="#A5D6A7" size="10">${savings:.2f} saved · Budget: ${budget:.2f}</font>', styles['Normal']),
@@ -338,7 +403,6 @@ def generate_report():
             story.append(item_table)
         story.append(Spacer(1, 0.12*inch))
 
-    # Savings
     savings_data = [[
         Paragraph('<font size="12" color="#2E7D32"><b>Total saved vs single-store shopping</b></font>', styles['Normal']),
         Paragraph(f'<font size="14" color="#2E7D32"><b>${savings:.2f} saved!</b></font>', styles['Normal']),
@@ -354,7 +418,6 @@ def generate_report():
     story.append(savings_table)
     story.append(Spacer(1, 0.15*inch))
 
-    # Nutrition
     nutr_header = [[Paragraph('<font color="white" size="11"><b>Nutritional Summary — Meets MoH NZ (2020) Guidelines</b></font>', styles['Normal'])]]
     nutr_header_table = Table(nutr_header, colWidths=[7*inch])
     nutr_header_table.setStyle(TableStyle([
