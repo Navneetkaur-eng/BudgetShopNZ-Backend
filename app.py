@@ -51,6 +51,16 @@ SIZE_PATTERN = re.compile(r'(\d+\.?\d*)\s*(kg|g|ml|l)\b', re.IGNORECASE)
 PACK_PATTERN = re.compile(r'(\d+)\s*pk\b', re.IGNORECASE)
 EGG_APPROX_WEIGHT_G = 55  # typical single egg weight
 
+# ═══════════════════════════════════════
+# NUTRITION GUIDELINES — WEEKLY, not daily.
+# BudgetShop NZ optimises a WEEKLY shopping basket, so it must be
+# validated against MoH NZ (2020) daily guidelines × 7, not a single
+# day's target. Comparing a week's groceries to a one-day target
+# would make every realistic basket look wildly "over guideline".
+# ═══════════════════════════════════════
+DAILY_GUIDELINES = {"calories": 2000, "protein": 50, "carbs": 250, "fat": 70, "fibre": 25}
+WEEKLY_GUIDELINES = {k: v * 7 for k, v in DAILY_GUIDELINES.items()}
+
 
 def parse_package_grams(item_name, category, unit_str=None):
     """Work out a realistic weight (in grams) for ONE unit of this
@@ -125,14 +135,11 @@ def load_grocery_data():
                     "Woolworths": float(row['woolworths']),
                 }
 
-                # Real, item-specific nutrition — uses the CSV's actual
-                # 'unit' column (e.g. "2L", "500g") when available
                 nutrition_data[name] = build_item_nutrition(name, category, row.get('unit'))
 
         print(f"✅ Loaded {len(grocery_data)} items from CSV!")
     except Exception as e:
         print(f"❌ CSV Error: {e}")
-        # Fallback data
         grocery_data = {
             "Anchor Full Cream Milk 2L": {"Pak'nSave": 2.99, "New World": 3.49, "Woolworths": 3.59},
             "Eggs Free Range 12pk":      {"Pak'nSave": 4.99, "New World": 4.49, "Woolworths": 5.19},
@@ -177,7 +184,7 @@ def find_item(search_name):
 def health():
     return jsonify({
         "status": "BudgetShop NZ API running!",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "total_items": len(grocery_data)
     })
 
@@ -212,7 +219,7 @@ def get_all_items():
     })
 
 # ═══════════════════════════════════════
-# ROUTE 5 — ML BUDGET OPTIMISATION (FIXED)
+# ROUTE 5 — ML BUDGET OPTIMISATION
 # ═══════════════════════════════════════
 @app.route('/api/optimise', methods=['POST'])
 def optimise():
@@ -237,8 +244,6 @@ def optimise():
     total_cost = 0
     store_plan = {}
 
-    # Real per-store totals — same items & quantities, priced as if
-    # bought entirely from that ONE store (not a "max price" guess)
     all_stores = ["Pak'nSave", "New World", "Woolworths"]
     single_store_totals = {store: 0 for store in all_stores}
 
@@ -267,8 +272,6 @@ def optimise():
     best_single_store = min(single_store_totals.values()) if single_store_totals else total_cost
     savings = round(best_single_store - total_cost, 2)
 
-    # Real, item-specific nutrition totals (each item scaled by its
-    # actual package size, not a flat category average)
     nutrition_total = {"calories": 0, "protein": 0, "carbs": 0, "fat": 0, "fibre": 0}
     for item_name, qty in item_quantities.items():
         if item_name in nutrition_data:
@@ -276,10 +279,10 @@ def optimise():
                 nutrition_total[key] += round(nutrition_data[item_name][key] * qty, 1)
     nutrition_total = {k: round(v, 1) for k, v in nutrition_total.items()}
 
-    guidelines = {"calories": 2000, "protein": 50, "carbs": 250, "fat": 70, "fibre": 25}
-    meets = all(nutrition_total[k] >= guidelines[k] * 0.7 for k in guidelines)
+    # Validated against WEEKLY MoH NZ (2020) guidelines — this is a
+    # weekly shopping basket, not a single day's food
+    meets = all(nutrition_total[k] >= WEEKLY_GUIDELINES[k] * 0.7 for k in WEEKLY_GUIDELINES)
 
-    # Per-item nutrition breakdown (for the "Per item" toggle in Results)
     item_nutrition = {}
     for item_name, qty in item_quantities.items():
         if item_name in nutrition_data:
@@ -301,6 +304,7 @@ def optimise():
         "within_budget": total_cost <= budget,
         "budget": budget,
         "nutrition": nutrition_total,
+        "nutrition_guidelines": WEEKLY_GUIDELINES,
         "item_nutrition": item_nutrition,
         "meets_moh_nz_2020": meets,
         "unmatched_items": unmatched_items,
@@ -324,13 +328,12 @@ def check_nutrition():
             for key in total:
                 total[key] += nutrition_data[matched][key]
 
-    guidelines = {"calories": 2000, "protein": 50, "carbs": 250, "fat": 70, "fibre": 25}
-    meets = all(total[k] >= guidelines[k] * 0.7 for k in guidelines)
+    meets = all(total[k] >= WEEKLY_GUIDELINES[k] * 0.7 for k in WEEKLY_GUIDELINES)
 
     return jsonify({
         "status": "success",
         "nutrition": {k: round(v, 1) for k, v in total.items()},
-        "guidelines": guidelines,
+        "guidelines": WEEKLY_GUIDELINES,
         "meets_moh_nz_2020": meets
     })
 
@@ -441,7 +444,7 @@ def generate_report():
     story.append(savings_table)
     story.append(Spacer(1, 0.15*inch))
 
-    nutr_header = [[Paragraph('<font color="white" size="11"><b>Nutritional Summary — Meets MoH NZ (2020) Guidelines</b></font>', styles['Normal'])]]
+    nutr_header = [[Paragraph('<font color="white" size="11"><b>Nutritional Summary — vs Weekly MoH NZ (2020) Guidelines</b></font>', styles['Normal'])]]
     nutr_header_table = Table(nutr_header, colWidths=[7*inch])
     nutr_header_table.setStyle(TableStyle([
         ('BACKGROUND', (0, 0), (-1, -1), GREEN),
